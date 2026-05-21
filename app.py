@@ -4,6 +4,8 @@ import io
 import json
 import os
 import re
+from csv import reader as csv_reader
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -11,12 +13,60 @@ import streamlit as st
 from docx import Document
 from openai import OpenAI
 from openai import APIStatusError
+from openpyxl import load_workbook
 from pypdf import PdfReader
 
 
+BASE_DIR = Path(__file__).resolve().parent
+ANZSCO_DIR = BASE_DIR / "anzsco"
+SIFA_DIR = BASE_DIR / "sifa"
+ADMIN_PROMPTS_DIR = BASE_DIR / "admin_prompts"
+ADMIN_PROMPT_CONFIG_PATH = ADMIN_PROMPTS_DIR / "config.json"
+ADMIN_USERNAME = "qibaitintern"
+ADMIN_PASSWORD = "qibaitintern"
+PROMPT_KEYS = {
+    "resume": "resume_default_prompt",
+    "interview_questions": "interview_questions_default_prompt",
+    "interview_analysis": "interview_analysis_default_prompt",
+}
+SUPPORTED_REFERENCE_EXTENSIONS = {".pdf", ".doc", ".docx", ".csv", ".xlsx", ".txt"}
+MAX_REFERENCE_CHARS_PER_FILE = 6000
+MAX_REFERENCE_CHARS_PER_FOLDER = 24000
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 DEFAULT_OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 DEFAULT_SCORE_ROWS = 5
+
+
+def ensure_app_directories() -> None:
+    ANZSCO_DIR.mkdir(exist_ok=True)
+    SIFA_DIR.mkdir(exist_ok=True)
+    ADMIN_PROMPTS_DIR.mkdir(exist_ok=True)
+
+
+def extract_text_from_doc_bytes(data: bytes) -> str:
+    return data.decode("utf-8", errors="ignore").replace("\x00", " ").strip()
+
+
+def extract_text_from_xlsx_bytes(data: bytes) -> str:
+    workbook = load_workbook(io.BytesIO(data), data_only=True)
+    parts: list[str] = []
+    for sheet in workbook.worksheets:
+        parts.append(f"[Sheet] {sheet.title}")
+        for row in sheet.iter_rows(values_only=True):
+            values = [str(cell) for cell in row if cell is not None and str(cell).strip()]
+            if values:
+                parts.append(" | ".join(values))
+    return "\n".join(parts).strip()
+
+
+def extract_text_from_csv_bytes(data: bytes) -> str:
+    text = data.decode("utf-8", errors="ignore")
+    rows = []
+    for row in csv_reader(io.StringIO(text)):
+        values = [cell.strip() for cell in row if cell and cell.strip()]
+        if values:
+            rows.append(" | ".join(values))
+    return "\n".join(rows).strip()
 
 
 def extract_text_from_upload(uploaded_file) -> str:
@@ -38,7 +88,44 @@ def extract_text_from_upload(uploaded_file) -> str:
         pages = [page.extract_text() or "" for page in reader.pages]
         return "\n".join(page.strip() for page in pages if page.strip()).strip()
 
-    raise ValueError("Unsupported file type. Please upload a DOCX, PDF, or TXT file.")
+    if name.endswith(".csv"):
+        return extract_text_from_csv_bytes(data)
+
+    if name.endswith(".xlsx"):
+        return extract_text_from_xlsx_bytes(data)
+
+    if name.endswith(".doc"):
+        return extract_text_from_doc_bytes(data)
+
+    raise ValueError("Unsupported file type. Please upload a DOC, DOCX, PDF, TXT, CSV, or XLSX file.")
+
+
+def extract_text_from_path(file_path: Path) -> str:
+    suffix = file_path.suffix.lower()
+    data = file_path.read_bytes()
+
+    if suffix == ".docx":
+        doc = Document(io.BytesIO(data))
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip()).strip()
+
+    if suffix == ".txt":
+        return data.decode("utf-8", errors="ignore").strip()
+
+    if suffix == ".pdf":
+        reader = PdfReader(io.BytesIO(data))
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n".join(page.strip() for page in pages if page.strip()).strip()
+
+    if suffix == ".csv":
+        return extract_text_from_csv_bytes(data)
+
+    if suffix == ".xlsx":
+        return extract_text_from_xlsx_bytes(data)
+
+    if suffix == ".doc":
+        return extract_text_from_doc_bytes(data)
+
+    return ""
 
 
 def get_openai_client() -> OpenAI:
@@ -252,6 +339,96 @@ def create_word_report(title: str, sections: list[tuple[str, str]]) -> bytes:
 def split_blocks(text: str) -> list[str]:
     blocks = [block.strip() for block in text.split("\n") if block.strip()]
     return blocks or ["No content generated."]
+
+
+def read_admin_prompt_config() -> dict[str, str]:
+    if not ADMIN_PROMPT_CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(ADMIN_PROMPT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_admin_prompt_config(config: dict[str, str]) -> None:
+    ADMIN_PROMPT_CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_admin_prompt(uploaded_file, prompt_key: str) -> Path:
+    config = read_admin_prompt_config()
+    suffix = Path(uploaded_file.name).suffix.lower() or ".txt"
+    target_path = ADMIN_PROMPTS_DIR / f"{prompt_key}{suffix}"
+
+    for existing in ADMIN_PROMPTS_DIR.glob(f"{prompt_key}.*"):
+        if existing.is_file():
+            existing.unlink()
+
+    target_path.write_bytes(uploaded_file.getvalue())
+    config[prompt_key] = target_path.name
+    write_admin_prompt_config(config)
+    return target_path
+
+
+def get_admin_prompt_text(prompt_key: str) -> str:
+    config = read_admin_prompt_config()
+    file_name = config.get(prompt_key)
+    if not file_name:
+        return ""
+
+    file_path = ADMIN_PROMPTS_DIR / file_name
+    if not file_path.exists():
+        return ""
+
+    return extract_text_from_path(file_path)
+
+
+def resolve_prompt_text(uploaded_file, prompt_key: str) -> tuple[str, str]:
+    if uploaded_file is not None:
+        return extract_text_from_upload(uploaded_file), "uploaded"
+
+    admin_prompt_text = get_admin_prompt_text(prompt_key)
+    if admin_prompt_text:
+        return admin_prompt_text, "admin_default"
+
+    return "", "missing"
+
+
+def load_reference_folder(folder_path: Path) -> str:
+    collected_parts: list[str] = []
+    current_chars = 0
+
+    for file_path in sorted(folder_path.rglob("*")):
+        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_REFERENCE_EXTENSIONS:
+            continue
+
+        try:
+            extracted = extract_text_from_path(file_path).strip()
+        except Exception:
+            extracted = ""
+
+        if not extracted:
+            continue
+
+        trimmed = extracted[:MAX_REFERENCE_CHARS_PER_FILE]
+        block = f"[File] {file_path.name}\n{trimmed}"
+        if current_chars + len(block) > MAX_REFERENCE_CHARS_PER_FOLDER:
+            remaining = MAX_REFERENCE_CHARS_PER_FOLDER - current_chars
+            if remaining <= 0:
+                break
+            block = block[:remaining]
+        collected_parts.append(block)
+        current_chars += len(block)
+        if current_chars >= MAX_REFERENCE_CHARS_PER_FOLDER:
+            break
+
+    return "\n\n".join(collected_parts).strip()
+
+
+def build_reference_payload() -> dict[str, str]:
+    return {
+        "anzsco_reference": load_reference_folder(ANZSCO_DIR),
+        "sifa_reference": load_reference_folder(SIFA_DIR),
+    }
 
 
 RESUME_TAB_NAMES = [
@@ -540,12 +717,12 @@ def render_resume_module() -> None:
     job_description = st.text_area("Job Description", height=220, key="resume_jd")
     resume_file = st.file_uploader(
         "Upload Resume",
-        type=["docx", "pdf", "txt"],
+        type=["doc", "docx", "pdf", "txt"],
         key="resume_file",
     )
     prompt_file = st.file_uploader(
         "Upload Analysis Prompt",
-        type=["docx", "txt"],
+        type=["doc", "docx", "pdf", "txt"],
         key="resume_prompt",
     )
     prompt_notes = st.text_area(
@@ -557,7 +734,7 @@ def render_resume_module() -> None:
     if st.button("Generate Resume Report", use_container_width=True):
         try:
             resume_text = extract_text_from_upload(resume_file)
-            prompt_text = extract_text_from_upload(prompt_file)
+            prompt_text, prompt_source = resolve_prompt_text(prompt_file, PROMPT_KEYS["resume"])
 
             if not job_description.strip():
                 st.error("Please provide a job description.")
@@ -566,8 +743,10 @@ def render_resume_module() -> None:
                 st.error("Please upload a resume file with readable content.")
                 return
             if not prompt_text:
-                st.error("Please upload a prompt document with readable content.")
+                st.error("Please upload a prompt document or ask an admin to configure the default resume prompt.")
                 return
+            if prompt_source == "admin_default":
+                st.info("Using the admin default resume prompt.")
 
             with st.spinner("Generating resume report..."):
                 report_body = call_llm(
@@ -593,6 +772,7 @@ def render_resume_module() -> None:
                         "resume_text": resume_text,
                         "custom_prompt": prompt_text,
                         "prompt_notes": prompt_notes,
+                        **build_reference_payload(),
                     },
                 )
 
@@ -623,19 +803,19 @@ def render_question_simulation() -> None:
     job_description = st.text_area("Job Description", height=220, key="interview_jd")
     resume_file = st.file_uploader(
         "Upload Resume",
-        type=["docx", "pdf", "txt"],
+        type=["doc", "docx", "pdf", "txt"],
         key="interview_resume_file",
     )
     prompt_file = st.file_uploader(
         "Upload Interview Prompt",
-        type=["docx", "txt"],
+        type=["doc", "docx", "pdf", "txt"],
         key="interview_prompt",
     )
 
     if st.button("Generate Interview Questions", use_container_width=True):
         try:
             resume_text = extract_text_from_upload(resume_file)
-            prompt_text = extract_text_from_upload(prompt_file)
+            prompt_text, prompt_source = resolve_prompt_text(prompt_file, PROMPT_KEYS["interview_questions"])
 
             if not job_description.strip():
                 st.error("Please provide a job description.")
@@ -644,8 +824,10 @@ def render_question_simulation() -> None:
                 st.error("Please upload a resume file with readable content.")
                 return
             if not prompt_text:
-                st.error("Please upload a prompt document with readable content.")
+                st.error("Please upload a prompt document or ask an admin to configure the default interview question prompt.")
                 return
+            if prompt_source == "admin_default":
+                st.info("Using the admin default interview question prompt.")
 
             with st.spinner("Generating interview question report..."):
                 question_report = call_llm(
@@ -660,6 +842,7 @@ def render_question_simulation() -> None:
                         "job_description": job_description,
                         "resume_text": resume_text,
                         "custom_prompt": prompt_text,
+                        **build_reference_payload(),
                     },
                 )
 
@@ -823,16 +1006,18 @@ def render_interview_report_section(
     st.markdown("### Report")
     prompt_file = st.file_uploader(
         "Upload Evaluation Prompt",
-        type=["docx", "txt"],
+        type=["doc", "docx", "pdf", "txt"],
         key="evaluation_prompt",
     )
 
     if st.button("Generate Interview Evaluation Report", use_container_width=True):
         try:
-            prompt_text = extract_text_from_upload(prompt_file)
+            prompt_text, prompt_source = resolve_prompt_text(prompt_file, PROMPT_KEYS["interview_analysis"])
             if not prompt_text:
-                st.error("Please upload a prompt document with readable content.")
+                st.error("Please upload a prompt document or ask an admin to configure the default interview analysis prompt.")
                 return
+            if prompt_source == "admin_default":
+                st.info("Using the admin default interview analysis prompt.")
 
             payload = {
                 "task": "interview_evaluation_report",
@@ -840,6 +1025,7 @@ def render_interview_report_section(
                 "metric_table": metric_rows,
                 "question_simulation_report": st.session_state.get("question_report_text", ""),
                 "custom_prompt": prompt_text,
+                **build_reference_payload(),
             }
 
             with st.spinner("Generating interview evaluation report..."):
@@ -877,11 +1063,98 @@ def render_interview_report_section(
     )
 
 
+def clear_admin_login_inputs() -> None:
+    st.session_state["clear_admin_login_inputs"] = True
+
+
+def apply_pending_admin_input_clear() -> None:
+    if st.session_state.get("clear_admin_login_inputs"):
+        st.session_state.pop("admin_username_input", None)
+        st.session_state.pop("admin_password_input", None)
+        st.session_state["clear_admin_login_inputs"] = False
+
+
+@st.dialog("Admin Login")
+def render_admin_login_dialog() -> None:
+    st.write("Enter the administrator credentials.")
+    username = st.text_input("Username", key="admin_username_input")
+    password = st.text_input("Password", type="password", key="admin_password_input")
+
+    login_col, cancel_col = st.columns(2)
+    with login_col:
+        if st.button("Log In", use_container_width=True):
+            if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+                st.session_state["is_admin"] = True
+                st.session_state["show_admin_login_dialog"] = False
+                st.session_state["admin_login_error"] = ""
+                clear_admin_login_inputs()
+                if st.session_state.get("api_key_input") == ADMIN_PASSWORD:
+                    st.session_state["api_key_input"] = ""
+                st.rerun()
+            else:
+                st.session_state["admin_login_error"] = "Invalid administrator username or password."
+                st.rerun()
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state["show_admin_login_dialog"] = False
+            st.session_state["admin_login_error"] = ""
+            clear_admin_login_inputs()
+            st.rerun()
+
+    if st.session_state.get("admin_login_error"):
+        st.error(st.session_state["admin_login_error"])
+
+
+def render_manage_tab() -> None:
+    st.subheader("Manage")
+    st.caption("Upload the default prompt files used when regular users leave prompt upload empty.")
+
+    prompt_sections = [
+        ("Resume Default Prompt", PROMPT_KEYS["resume"], "manage_resume_prompt"),
+        ("Interview Question Default Prompt", PROMPT_KEYS["interview_questions"], "manage_interview_questions_prompt"),
+        ("Interview Analysis Default Prompt", PROMPT_KEYS["interview_analysis"], "manage_interview_analysis_prompt"),
+    ]
+
+    config = read_admin_prompt_config()
+    for label, prompt_key, uploader_key in prompt_sections:
+        st.markdown(f"### {label}")
+        st.write(f"Current file: `{config.get(prompt_key, 'Not configured')}`")
+        uploaded_file = st.file_uploader(
+            f"Upload {label}",
+            type=["doc", "docx", "pdf", "txt"],
+            key=uploader_key,
+        )
+        if uploaded_file is not None:
+            upload_signature = f"{uploaded_file.name}:{len(uploaded_file.getvalue())}"
+            signature_key = f"{prompt_key}_saved_signature"
+            if st.session_state.get(signature_key) != upload_signature:
+                saved_path = save_admin_prompt(uploaded_file, prompt_key)
+                st.session_state[signature_key] = upload_signature
+                config[prompt_key] = saved_path.name
+                st.success(f"Saved default prompt to `{saved_path.name}`.")
+
+    st.markdown("### Reference Libraries")
+    st.write(f"`anzsco` folder: `{ANZSCO_DIR}`")
+    st.write(f"`sifa` folder: `{SIFA_DIR}`")
+    st.write("Supported reference file types: `pdf`, `doc`, `docx`, `csv`, `xlsx`, `txt`.")
+
+
 def main() -> None:
     st.set_page_config(page_title="Career Copilot MVP", page_icon=":memo:", layout="wide")
+    ensure_app_directories()
 
     if "api_key_input" not in st.session_state:
         st.session_state["api_key_input"] = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
+    if "is_admin" not in st.session_state:
+        st.session_state["is_admin"] = False
+    if "show_admin_login_dialog" not in st.session_state:
+        st.session_state["show_admin_login_dialog"] = False
+    if "admin_login_error" not in st.session_state:
+        st.session_state["admin_login_error"] = ""
+    if "clear_admin_login_inputs" not in st.session_state:
+        st.session_state["clear_admin_login_inputs"] = False
+
+    apply_pending_admin_input_clear()
 
     available_models, model_fetch_warning = get_available_models()
     st.session_state["available_models"] = available_models
@@ -915,7 +1188,7 @@ def main() -> None:
             f"Output {format_price_per_million(pricing.get('completion'))}, "
             f"Context {format_context_length(selected_model.get('context_length'))}"
         )
-        if os.getenv("OPENROUTER_API_KEY"):
+        if st.session_state.get("api_key_input") or os.getenv("OPENROUTER_API_KEY"):
             st.write("Provider: `OpenRouter`")
             st.write("Models are fetched dynamically and filtered to `:free` only.")
             if model_fetch_warning:
@@ -924,12 +1197,30 @@ def main() -> None:
             st.write("Provider: `OpenAI-compatible default`")
             st.write("Set `OPENROUTER_API_KEY` to enable dynamic OpenRouter free-model filtering.")
         st.write("Set `OPENROUTER_API_KEY` or `OPENAI_API_KEY` before generating reports.")
-        st.write("Supported uploads: `DOCX`, `PDF`, `TXT`.")
+        st.write("Supported uploads: `DOC`, `DOCX`, `PDF`, `TXT`, `CSV`, `XLSX`.")
         st.write(f"Current selected model: `{st.session_state['selected_model']}`")
         if st.session_state.get("active_request_model"):
             st.write(f"Last request model: `{st.session_state['active_request_model']}`")
+        st.write("---")
+        if st.session_state["is_admin"]:
+            st.success("Logged in as admin.")
+            if st.button("Log Out", use_container_width=True):
+                st.session_state["is_admin"] = False
+                st.session_state["show_admin_login_dialog"] = False
+                st.session_state["admin_login_error"] = ""
+                clear_admin_login_inputs()
+                st.rerun()
+        else:
+            if st.button("Log In", use_container_width=True):
+                st.session_state["show_admin_login_dialog"] = True
 
-    resume_tab, interview_tab = st.tabs(["Resume", "Interview"])
+    if st.session_state.get("show_admin_login_dialog"):
+        render_admin_login_dialog()
+
+    if st.session_state["is_admin"]:
+        resume_tab, interview_tab, manage_tab = st.tabs(["Resume", "Interview", "Manage"])
+    else:
+        resume_tab, interview_tab = st.tabs(["Resume", "Interview"])
 
     with resume_tab:
         render_resume_module()
@@ -939,6 +1230,10 @@ def main() -> None:
         scored_rows = render_scoring_section()
         metric_rows = render_metric_section(scored_rows)
         render_interview_report_section(scored_rows, metric_rows)
+
+    if st.session_state["is_admin"]:
+        with manage_tab:
+            render_manage_tab()
 
 
 if __name__ == "__main__":
